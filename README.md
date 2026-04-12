@@ -1,0 +1,2 @@
+# macOS Security Log Analyzer
+An AI based process monitor for Macs that analyzes running processes on your machine as well as startup scripts and background processes and looks for any suspicious behavior.
