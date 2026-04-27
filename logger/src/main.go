@@ -222,11 +222,33 @@ func resolveOrBuildMonitor(repoRoot string) (string, error) {
 	}
 
 	source := filepath.Join(repoRoot, "monitor", "src", "main.c")
-	build := exec.Command("clang", "-fcolor-diagnostics", "-fansi-escape-codes", "-g", source, "-o", outputPath)
+	entitlements := filepath.Join(repoRoot, "monitor", "entitlements.plist")
+	build := exec.Command("clang",
+		"-fblocks", "-DENABLE_ENDPOINT_SECURITY",
+		"-isysroot", "/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk",
+		source,
+		"-lEndpointSecurity", "-lbsm",
+		"-o", outputPath,
+	)
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
 
 	fmt.Println("No monitor executable found. Building monitor with clang...")
+	if err := build.Run(); err != nil {
+		return "", fmt.Errorf("failed to compile monitor: %w", err)
+	}
+
+	sign := exec.Command("codesign",
+		"--sign", "Developer ID Application: Oscar Capraro (398CS47WP9)",
+		"--entitlements", entitlements,
+		"--force", outputPath,
+	)
+	sign.Stdout = os.Stdout
+	sign.Stderr = os.Stderr
+	fmt.Println("Signing monitor with Endpoint Security entitlement...")
+	if err := sign.Run(); err != nil {
+		return "", fmt.Errorf("failed to sign monitor: %w", err)
+	}
 	if err := build.Run(); err != nil {
 		return "", fmt.Errorf("failed to compile monitor: %w", err)
 	}

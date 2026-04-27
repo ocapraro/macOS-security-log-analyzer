@@ -1,57 +1,77 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <EndpointSecurity/EndpointSecurity.h>
+#include <bsm/libbsm.h>
+#include <dispatch/dispatch.h>
 #include <time.h>
 
-void emit_exec(int pid, int ppid, const char *proc, const char *target) {
-    printf(
-        "{\"ts\":%ld,\"event\":\"exec\",\"pid\":%d,\"ppid\":%d,"
-        "\"process_path\":\"%s\",\"target_path\":\"%s\"}\n",
-        time(NULL), pid, ppid, proc, target
-    );
-    fflush(stdout);
-}
+int main(void) {
+    es_client_t *client = NULL;
 
-void emit_fork(int parent, int child) {
-    printf(
-        "{\"ts\":%ld,\"event\":\"fork\",\"pid\":%d,\"child_pid\":%d}\n",
-        time(NULL), parent, child
-    );
-    fflush(stdout);
-}
+    es_new_client_result_t result = es_new_client(&client, ^(es_client_t *c, const es_message_t *msg) {
+        long ts = (long)msg->time.tv_sec;
 
-void emit_write(int pid, const char *path) {
-    printf(
-        "{\"ts\":%ld,\"event\":\"write\",\"pid\":%d,\"target_path\":\"%s\"}\n",
-        time(NULL), pid, path
-    );
-    fflush(stdout);
-}
+        switch (msg->event_type) {
+            case ES_EVENT_TYPE_NOTIFY_EXEC: {
+                const char *proc   = msg->process->executable->path.data;
+                const char *target = msg->event.exec.target->executable->path.data;
+                printf(
+                    "{\"ts\":%ld,\"event\":\"exec\",\"pid\":%d,\"ppid\":%d,"
+                    "\"process_path\":\"%s\",\"target_path\":\"%s\"}\n",
+                    ts,
+                    audit_token_to_pid(msg->process->audit_token),
+                    msg->process->ppid,
+                    proc   ? proc   : "",
+                    target ? target : ""
+                );
+                fflush(stdout);
+                break;
+            }
+            case ES_EVENT_TYPE_NOTIFY_FORK: {
+                printf(
+                    "{\"ts\":%ld,\"event\":\"fork\",\"pid\":%d,\"child_pid\":%d}\n",
+                    ts,
+                    audit_token_to_pid(msg->process->audit_token),
+                    audit_token_to_pid(msg->event.fork.child->audit_token)
+                );
+                fflush(stdout);
+                break;
+            }
+            case ES_EVENT_TYPE_NOTIFY_WRITE: {
+                const char *path = msg->event.write.target->path.data;
+                printf(
+                    "{\"ts\":%ld,\"event\":\"write\",\"pid\":%d,\"target_path\":\"%s\"}\n",
+                    ts,
+                    audit_token_to_pid(msg->process->audit_token),
+                    path ? path : ""
+                );
+                fflush(stdout);
+                break;
+            }
+            default:
+                break;
+        }
+    });
 
-int main() {
-    int base_pid = 1000;
-
-    printf("Starting dummy event stream...\n");
-
-    while (1) {
-        int shell = base_pid++;
-        int curl = base_pid++;
-        int payload = base_pid++;
-
-        // Simulate: bash -> curl -> download -> execute
-        emit_exec(shell, 1, "/bin/bash", "/bin/bash");
-        sleep(1);
-
-        emit_fork(shell, curl);
-        emit_exec(curl, shell, "/usr/bin/curl", "http://malicious.com/payload");
-        sleep(1);
-
-        emit_write(curl, "/tmp/payload");
-        sleep(1);
-
-        emit_exec(payload, curl, "/tmp/payload", "/tmp/payload");
-        sleep(3);
+    if (result != ES_NEW_CLIENT_RESULT_SUCCESS) {
+        fprintf(stderr, "{\"error\":\"es_new_client failed\",\"code\":%d}\n", result);
+        return 1;
     }
 
+    es_event_type_t events[] = {
+        ES_EVENT_TYPE_NOTIFY_EXEC,
+        ES_EVENT_TYPE_NOTIFY_FORK,
+        ES_EVENT_TYPE_NOTIFY_WRITE,
+    };
+
+    if (es_subscribe(client, events, sizeof(events) / sizeof(events[0])) != ES_RETURN_SUCCESS) {
+        fprintf(stderr, "{\"error\":\"es_subscribe failed\"}\n");
+        es_delete_client(client);
+        return 1;
+    }
+
+    fprintf(stderr, "{\"status\":\"ES client subscribed, monitoring events...\"}\n");
+
+    dispatch_main();
     return 0;
 }
