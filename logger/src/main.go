@@ -22,7 +22,6 @@ import (
 const (
 	llmBatchThreshold = 25
 	llmRetryBackoff   = 15 * time.Second
-	llmRequestTimeout = 30 * time.Second
 )
 
 type event struct {
@@ -516,7 +515,7 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 	}
 
 	prompt := fmt.Sprintf(
-		"You are a security log analyst. Review the JSON array of logs below and return ONE JSON object only. The object must contain: timestamp (string), reasoning (string), normalLogs (array of exact original log lines judged normal), suspicousLogs (array of exact original log lines judged suspicious), dangerousLogs (array of exact original log lines judged dangerous). Return ONLY raw JSON.\\n\\nLogs: %s",
+		"You are a security log analyst. Review the JSON array of logs below and return ONE JSON object only with this exact shape: {\"timestamp\":\"RFC3339\",\"reasoning\":\"...\",\"normalLogs\":[],\"suspicousLogs\":[],\"dangerousLogs\":[]}. Use only exact log lines from input arrays. Do not use markdown, code fences, or extra text. Return ONLY raw JSON.\\n\\nLogs: %s",
 		string(logsJSON),
 	)
 
@@ -532,14 +531,14 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 	}
 
 	requestURL := ollamaGenerateURL(ollamaEndpoint)
-	fmt.Printf("LLM request start: endpoint=%s model=%s logs=%d timeout=%s\n", requestURL, llmInstance, len(logLines), llmRequestTimeout)
+	fmt.Printf("LLM request start: endpoint=%s model=%s logs=%d timeout=none\n", requestURL, llmInstance, len(logLines))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
 	if err != nil {
 		return llmBatchAssessment{}, fmt.Errorf("unable to create Ollama request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := (&http.Client{Timeout: llmRequestTimeout}).Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
 		return llmBatchAssessment{}, fmt.Errorf("unable to call Ollama endpoint %s: %w", requestURL, err)
 	}
@@ -568,12 +567,12 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 
 	jsonPayload, err := extractJSONObjectPayload(parsed.Response)
 	if err != nil {
-		return llmBatchAssessment{}, err
+		return fallbackBatchAssessment(logLines, parsed.Response), nil
 	}
 
 	var assessment llmBatchAssessment
 	if err := json.Unmarshal([]byte(jsonPayload), &assessment); err != nil {
-		return llmBatchAssessment{}, fmt.Errorf("unable to parse LLM assessment object: %w", err)
+		return fallbackBatchAssessment(logLines, parsed.Response), nil
 	}
 
 	if strings.TrimSpace(assessment.Timestamp) == "" {
@@ -581,10 +580,27 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 	}
 
 	if len(assessment.NormalLogs)+len(assessment.SuspicousLogs)+len(assessment.DangerousLogs) == 0 {
-		return llmBatchAssessment{}, errors.New("LLM returned empty grouped assessment")
+		return fallbackBatchAssessment(logLines, parsed.Response), nil
 	}
 
 	return assessment, nil
+}
+
+func fallbackBatchAssessment(logLines []string, rawResponse string) llmBatchAssessment {
+	reason := strings.TrimSpace(rawResponse)
+	if reason == "" {
+		reason = "LLM returned no structured JSON response; defaulted all logs to suspicious."
+	} else {
+		reason = "LLM returned non-JSON response; defaulted all logs to suspicious. Raw response: " + reason
+	}
+
+	return llmBatchAssessment{
+		Timestamp:     time.Now().Format(time.RFC3339),
+		Reasoning:     reason,
+		NormalLogs:    []string{},
+		SuspicousLogs: append([]string(nil), logLines...),
+		DangerousLogs: []string{},
+	}
 }
 
 func extractJSONObjectPayload(response string) (string, error) {
