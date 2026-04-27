@@ -13,3 +13,13 @@ out/
 
 # secrets
 .env
+.env.*
+!.env.example
+*.provisionprofile
+*.mobileprovision
+*.cer
+*.cert
+*.crt
+*.key
+*.p12
+*.pem
