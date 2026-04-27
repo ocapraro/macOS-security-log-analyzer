@@ -44,6 +44,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Check for macOS 26 beta (ES not yet available)
+	versionCmd := exec.Command("sw_vers", "-productVersion")
+	versionOutput, err := versionCmd.Output()
+	if err == nil {
+		version := strings.TrimSpace(string(versionOutput))
+		if strings.HasPrefix(version, "26.") {
+			fmt.Printf("WARNING: macOS 26 beta detected -- Endpoint Security is not yet functional in this beta.\n")
+			fmt.Printf("    The monitor will emit synthetic events instead.\n")
+			fmt.Printf("    ES is fully functional on macOS 15.x and later stable releases.\n\n")
+		}
+	}
+
 	ollamaEndpoint, llmInstance, llmConfigErr := loadLLMConfig(repoRoot)
 	if llmConfigErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: LLM log analysis disabled: %v\n", llmConfigErr)
