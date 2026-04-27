@@ -474,8 +474,21 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 			return
 		}
 
-		fmt.Printf("LLM response received for %d logs\n", len(combined.NormalLogs)+len(combined.SuspicousLogs)+len(combined.DangerousLogs))
-		fmt.Println(string(payload))
+		total := len(combined.NormalLogs) + len(combined.SuspicousLogs) + len(combined.DangerousLogs)
+		fmt.Printf("LLM response received for %d logs (normal=%d suspicious=%d dangerous=%d)\n",
+			total, len(combined.NormalLogs), len(combined.SuspicousLogs), len(combined.DangerousLogs))
+		for _, log := range combined.NormalLogs {
+			fmt.Printf("  [NORMAL]    %s\n", log)
+		}
+		for _, log := range combined.SuspicousLogs {
+			fmt.Printf("  [SUSPICIOUS] %s\n", log)
+		}
+		for _, log := range combined.DangerousLogs {
+			fmt.Printf("  [DANGEROUS]  %s\n", log)
+		}
+		if strings.TrimSpace(combined.Reasoning) != "" {
+			fmt.Printf("  Reasoning: %s\n", combined.Reasoning)
+		}
 
 		if err := appendLogBlock(analysisFile, analysisFileMu, string(payload)); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to append LLM analysis to log: %v\n", err)
