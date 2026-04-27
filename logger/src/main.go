@@ -131,14 +131,14 @@ func main() {
 	defer signal.Stop(stop)
 
 	go func() {
-		sig := <-stop
+		<-stop
 		fmt.Printf("\nShutdown signal received. Graceful shutdown...\n")
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
 
 		select {
-		case second := <-stop:
+		case <-stop:
 			fmt.Printf("Force kill...\n")
 			llmCancel()
 			if cmd.Process != nil {
@@ -227,9 +227,14 @@ func resolveOrBuildMonitor(repoRoot string) (string, error) {
 
 	source := filepath.Join(repoRoot, "monitor", "src", "main.c")
 	entitlements := filepath.Join(repoRoot, "monitor", "entitlements.plist")
+	sdkPathBytes, err := exec.Command("xcrun", "--sdk", "macosx", "--show-sdk-path").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to locate macOS SDK: %w", err)
+	}
+	sdkPath := strings.TrimSpace(string(sdkPathBytes))
 	build := exec.Command("clang",
 		"-fblocks", "-DENABLE_ENDPOINT_SECURITY",
-		"-isysroot", "/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk",
+		"-isysroot", sdkPath,
 		source,
 		"-lEndpointSecurity", "-lbsm",
 		"-o", outputPath,
@@ -242,8 +247,12 @@ func resolveOrBuildMonitor(repoRoot string) (string, error) {
 		return "", fmt.Errorf("failed to compile monitor: %w", err)
 	}
 
+	identity := strings.TrimSpace(os.Getenv("MONITOR_CODESIGN_IDENTITY"))
+	if identity == "" {
+		return "", errors.New("MONITOR_CODESIGN_IDENTITY must be set to a local Apple signing identity")
+	}
 	sign := exec.Command("codesign",
-		"--sign", "Developer ID Application: Oscar Capraro (398CS47WP9)",
+		"--sign", identity,
 		"--entitlements", entitlements,
 		"--force", outputPath,
 	)
@@ -252,9 +261,6 @@ func resolveOrBuildMonitor(repoRoot string) (string, error) {
 	fmt.Println("Signing monitor with Endpoint Security entitlement...")
 	if err := sign.Run(); err != nil {
 		return "", fmt.Errorf("failed to sign monitor: %w", err)
-	}
-	if err := build.Run(); err != nil {
-		return "", fmt.Errorf("failed to compile monitor: %w", err)
 	}
 
 	if !isExecutable(outputPath) {
