@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,12 @@ import (
 	"time"
 )
 
+const (
+	llmBatchThreshold = 25
+	llmRetryBackoff   = 15 * time.Second
+	llmRequestTimeout = 30 * time.Second
+)
+
 type event struct {
 	TS          int64  `json:"ts"`
 	Event       string `json:"event"`
@@ -29,6 +36,9 @@ type event struct {
 }
 
 func main() {
+	llmCtx, llmCancel := context.WithCancel(context.Background())
+	defer llmCancel()
+
 	repoRoot, err := findRepoRoot()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to locate repository root: %v\n", err)
@@ -45,6 +55,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unable to create log directory: %v\n", err)
 		os.Exit(1)
 	}
+	analysisFilePath := filepath.Join(repoRoot, "logger", "out", "analysis.jsonl")
 
 	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -52,6 +63,16 @@ func main() {
 		os.Exit(1)
 	}
 	defer logFile.Close()
+
+	var analysisFile *os.File
+	if llmConfigErr == nil {
+		analysisFile, err = os.OpenFile(analysisFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "unable to open analysis log file: %v\n", err)
+			os.Exit(1)
+		}
+		defer analysisFile.Close()
+	}
 
 	monitorPath, err := resolveOrBuildMonitor(repoRoot)
 	if err != nil {
@@ -61,6 +82,9 @@ func main() {
 
 	fmt.Printf("Logger started. Running monitor: %s\n", monitorPath)
 	fmt.Printf("Verbose logs will be written to: %s\n", logFilePath)
+	if llmConfigErr == nil {
+		fmt.Printf("LLM analysis will be written to: %s\n", analysisFilePath)
+	}
 
 	cmd := exec.Command(monitorPath)
 	stdout, err := cmd.StdoutPipe()
@@ -80,13 +104,14 @@ func main() {
 	}
 
 	var logFileMu sync.Mutex
+	var analysisFileMu sync.Mutex
 	var logLines chan string
 	var llmDone chan struct{}
 	if llmConfigErr == nil {
 		logLines = make(chan string, 4096)
 		llmDone = make(chan struct{})
 		go func() {
-			runLLMAnalysisLoop(logLines, logFile, &logFileMu, ollamaEndpoint, llmInstance)
+			runLLMAnalysisLoop(llmCtx, logLines, analysisFile, &analysisFileMu, ollamaEndpoint, llmInstance)
 			close(llmDone)
 		}()
 	}
@@ -98,12 +123,30 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
 
 	go func() {
-		<-stop
-		fmt.Println("\nReceived stop signal. Shutting down monitor...")
+		sig := <-stop
+		fmt.Printf("\nReceived stop signal (%s). Attempting graceful shutdown...\n", sig.String())
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+
+		select {
+		case second := <-stop:
+			fmt.Printf("Received second stop signal (%s). Forcing monitor shutdown now...\n", second.String())
+			fmt.Println("Cancelling in-flight LLM requests...")
+			llmCancel()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		case <-time.After(5 * time.Second):
+			fmt.Println("Graceful shutdown timed out. Forcing monitor shutdown...")
+			fmt.Println("Cancelling in-flight LLM requests...")
+			llmCancel()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
 		}
 	}()
 
@@ -124,7 +167,11 @@ func main() {
 		close(logLines)
 	}
 	if llmDone != nil {
-		<-llmDone
+		select {
+		case <-llmDone:
+		case <-time.After(2 * time.Second):
+			fmt.Println("LLM worker is still shutting down; exiting without waiting further.")
+		}
 	}
 
 	if err := cmd.Wait(); err != nil {
@@ -323,21 +370,27 @@ func parseDotEnv(path string) (map[string]string, error) {
 	return values, nil
 }
 
-type llmLogAssessment struct {
-	Reasoning  string `json:"reasoning"`
-	Assessment string `json:"assessment"`
-	Log        string `json:"log"`
+type llmBatchAssessment struct {
+	Timestamp     string   `json:"timestamp"`
+	Reasoning     string   `json:"reasoning"`
+	NormalLogs    []string `json:"normalLogs"`
+	SuspicousLogs []string `json:"suspicousLogs"`
+	DangerousLogs []string `json:"dangerousLogs"`
 }
 
-func runLLMAnalysisLoop(logLines <-chan string, logFile *os.File, logFileMu *sync.Mutex, ollamaEndpoint, llmInstance string) {
+func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFile *os.File, analysisFileMu *sync.Mutex, ollamaEndpoint, llmInstance string) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	pending := make([]string, 0, 8)
+	pending := make([]string, 0, 32)
 	var oldest time.Time
+	var retryAfter time.Time
 
-	flush := func(trigger string) {
+	flush := func(trigger string, force bool) {
 		if len(pending) == 0 {
+			return
+		}
+		if !force && !retryAfter.IsZero() && time.Now().Before(retryAfter) {
 			return
 		}
 
@@ -348,59 +401,95 @@ func runLLMAnalysisLoop(logLines <-chan string, logFile *os.File, logFileMu *syn
 		fmt.Printf("LLM dispatch (%s): sending %d new logs\n", trigger, len(batch))
 
 		batches := [][]string{batch}
-		if len(batch) > 5 {
+		if len(batch) > 25 {
 			mid := (len(batch) + 1) / 2
 			batches = [][]string{batch[:mid], batch[mid:]}
 			fmt.Printf("LLM dispatch: splitting into %d concurrent requests (%d + %d logs)\n", len(batches), len(batches[0]), len(batches[1]))
 		}
 
 		type result struct {
-			items []llmLogAssessment
-			err   error
+			item llmBatchAssessment
+			err  error
+			logs []string
 		}
 
 		results := make(chan result, len(batches))
 		for i := range batches {
 			go func(logChunk []string) {
-				items, err := analyzeLogBatch(logChunk, ollamaEndpoint, llmInstance)
-				results <- result{items: items, err: err}
+				item, err := analyzeLogBatch(ctx, logChunk, ollamaEndpoint, llmInstance)
+				results <- result{item: item, err: err, logs: logChunk}
 			}(batches[i])
 		}
 
-		allItems := make([]llmLogAssessment, 0, len(batch))
+		combined := llmBatchAssessment{
+			Timestamp:     time.Now().Format(time.RFC3339),
+			NormalLogs:    make([]string, 0, len(batch)),
+			SuspicousLogs: make([]string, 0, len(batch)),
+			DangerousLogs: make([]string, 0, len(batch)),
+		}
+		reasoningParts := make([]string, 0, len(batches))
+		failedLogs := make([]string, 0, len(batch))
 		for i := 0; i < len(batches); i++ {
 			result := <-results
 			if result.err != nil {
-				fmt.Fprintf(os.Stderr, "LLM dispatch failed: %v\n", result.err)
+				fmt.Fprintf(os.Stderr, "LLM dispatch failed for %d logs: %v\n", len(result.logs), result.err)
+				failedLogs = append(failedLogs, result.logs...)
 				continue
 			}
-			allItems = append(allItems, result.items...)
+			combined.NormalLogs = append(combined.NormalLogs, result.item.NormalLogs...)
+			combined.SuspicousLogs = append(combined.SuspicousLogs, result.item.SuspicousLogs...)
+			combined.DangerousLogs = append(combined.DangerousLogs, result.item.DangerousLogs...)
+			if strings.TrimSpace(result.item.Reasoning) != "" {
+				reasoningParts = append(reasoningParts, result.item.Reasoning)
+			}
 		}
 
-		if len(allItems) == 0 {
+		if len(combined.NormalLogs)+len(combined.SuspicousLogs)+len(combined.DangerousLogs) == 0 {
 			fmt.Println("LLM dispatch returned no parsed assessments.")
+			if len(failedLogs) > 0 {
+				pending = append(failedLogs, pending...)
+				if oldest.IsZero() {
+					oldest = time.Now()
+				}
+				retryAfter = time.Now().Add(llmRetryBackoff)
+				fmt.Printf("LLM retry scheduled in %s for %d logs\n", llmRetryBackoff, len(failedLogs))
+			}
 			return
 		}
 
-		payload, err := json.MarshalIndent(allItems, "", "  ")
+		if len(failedLogs) > 0 {
+			pending = append(failedLogs, pending...)
+			if oldest.IsZero() {
+				oldest = time.Now()
+			}
+			retryAfter = time.Now().Add(llmRetryBackoff)
+			fmt.Printf("LLM partial success; retrying %d failed logs in %s\n", len(failedLogs), llmRetryBackoff)
+		} else {
+			retryAfter = time.Time{}
+		}
+		combined.Reasoning = strings.Join(reasoningParts, "\n\n")
+
+		payload, err := json.MarshalIndent(combined, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "unable to serialize LLM analysis: %v\n", err)
 			return
 		}
 
-		fmt.Printf("LLM response received for %d logs\n", len(allItems))
+		fmt.Printf("LLM response received for %d logs\n", len(combined.NormalLogs)+len(combined.SuspicousLogs)+len(combined.DangerousLogs))
 		fmt.Println(string(payload))
 
-		if err := appendLogBlock(logFile, logFileMu, fmt.Sprintf("[LLM_ANALYSIS_JSON]\n%s", string(payload))); err != nil {
+		if err := appendLogBlock(analysisFile, analysisFileMu, string(payload)); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to append LLM analysis to log: %v\n", err)
 		}
 	}
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case line, ok := <-logLines:
 			if !ok {
-				flush("shutdown")
+				flush("shutdown", true)
 				return
 			}
 
@@ -409,25 +498,25 @@ func runLLMAnalysisLoop(logLines <-chan string, logFile *os.File, logFileMu *syn
 			}
 			pending = append(pending, line)
 
-			if len(pending) >= 5 {
-				flush("count>=5")
+			if len(pending) >= llmBatchThreshold {
+				flush("count>=25", false)
 			}
 		case <-ticker.C:
 			if len(pending) > 0 && !oldest.IsZero() && time.Since(oldest) >= 1*time.Minute {
-				flush("age>=1m")
+				flush("age>=1m", false)
 			}
 		}
 	}
 }
 
-func analyzeLogBatch(logLines []string, ollamaEndpoint, llmInstance string) ([]llmLogAssessment, error) {
+func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llmInstance string) (llmBatchAssessment, error) {
 	logsJSON, err := json.Marshal(logLines)
 	if err != nil {
-		return nil, fmt.Errorf("unable to prepare log batch: %w", err)
+		return llmBatchAssessment{}, fmt.Errorf("unable to prepare log batch: %w", err)
 	}
 
 	prompt := fmt.Sprintf(
-		"You are a security log analyst. For EACH log in the JSON array below, return a JSON array with exactly one object per log in the same order. Each object must contain: reasoning (string), assessment (one of normal/suspicious/dangerous), and log (the exact original log line). Return ONLY raw JSON.\\n\\nLogs: %s",
+		"You are a security log analyst. Review the JSON array of logs below and return ONE JSON object only. The object must contain: timestamp (string), reasoning (string), normalLogs (array of exact original log lines judged normal), suspicousLogs (array of exact original log lines judged suspicious), dangerousLogs (array of exact original log lines judged dangerous). Return ONLY raw JSON.\\n\\nLogs: %s",
 		string(logsJSON),
 	)
 
@@ -439,23 +528,30 @@ func analyzeLogBatch(logLines []string, ollamaEndpoint, llmInstance string) ([]l
 
 	requestBody, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("unable to build Ollama request: %w", err)
+		return llmBatchAssessment{}, fmt.Errorf("unable to build Ollama request: %w", err)
 	}
 
 	requestURL := ollamaGenerateURL(ollamaEndpoint)
-	resp, err := (&http.Client{Timeout: 90 * time.Second}).Post(requestURL, "application/json", bytes.NewReader(requestBody))
+	fmt.Printf("LLM request start: endpoint=%s model=%s logs=%d timeout=%s\n", requestURL, llmInstance, len(logLines), llmRequestTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
 	if err != nil {
-		return nil, fmt.Errorf("unable to call Ollama endpoint %s: %w", requestURL, err)
+		return llmBatchAssessment{}, fmt.Errorf("unable to create Ollama request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: llmRequestTimeout}).Do(req)
+	if err != nil {
+		return llmBatchAssessment{}, fmt.Errorf("unable to call Ollama endpoint %s: %w", requestURL, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("unable to read Ollama response: %w", err)
+		return llmBatchAssessment{}, fmt.Errorf("unable to read Ollama response: %w", err)
 	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, fmt.Errorf("Ollama API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return llmBatchAssessment{}, fmt.Errorf("Ollama API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var parsed struct {
@@ -463,50 +559,44 @@ func analyzeLogBatch(logLines []string, ollamaEndpoint, llmInstance string) ([]l
 		Error    string `json:"error"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("unable to parse Ollama response JSON: %w", err)
+		return llmBatchAssessment{}, fmt.Errorf("unable to parse Ollama response JSON: %w", err)
 	}
 
 	if strings.TrimSpace(parsed.Error) != "" {
-		return nil, errors.New(parsed.Error)
+		return llmBatchAssessment{}, errors.New(parsed.Error)
 	}
 
-	jsonPayload, err := extractJSONArrayPayload(parsed.Response)
+	jsonPayload, err := extractJSONObjectPayload(parsed.Response)
 	if err != nil {
-		return nil, err
+		return llmBatchAssessment{}, err
 	}
 
-	var assessments []llmLogAssessment
-	if err := json.Unmarshal([]byte(jsonPayload), &assessments); err != nil {
-		return nil, fmt.Errorf("unable to parse LLM assessment array: %w", err)
+	var assessment llmBatchAssessment
+	if err := json.Unmarshal([]byte(jsonPayload), &assessment); err != nil {
+		return llmBatchAssessment{}, fmt.Errorf("unable to parse LLM assessment object: %w", err)
 	}
 
-	for i := range assessments {
-		assessments[i].Assessment = strings.ToLower(strings.TrimSpace(assessments[i].Assessment))
-		if assessments[i].Assessment != "normal" && assessments[i].Assessment != "suspicious" && assessments[i].Assessment != "dangerous" {
-			assessments[i].Assessment = "suspicious"
-		}
-		if strings.TrimSpace(assessments[i].Log) == "" && i < len(logLines) {
-			assessments[i].Log = logLines[i]
-		}
+	if strings.TrimSpace(assessment.Timestamp) == "" {
+		assessment.Timestamp = time.Now().Format(time.RFC3339)
 	}
 
-	if len(assessments) == 0 {
-		return nil, errors.New("LLM returned empty assessment list")
+	if len(assessment.NormalLogs)+len(assessment.SuspicousLogs)+len(assessment.DangerousLogs) == 0 {
+		return llmBatchAssessment{}, errors.New("LLM returned empty grouped assessment")
 	}
 
-	return assessments, nil
+	return assessment, nil
 }
 
-func extractJSONArrayPayload(response string) (string, error) {
+func extractJSONObjectPayload(response string) (string, error) {
 	trimmed := strings.TrimSpace(response)
 	if trimmed == "" {
 		return "", errors.New("LLM returned empty response")
 	}
 
-	start := strings.Index(trimmed, "[")
-	end := strings.LastIndex(trimmed, "]")
+	start := strings.Index(trimmed, "{")
+	end := strings.LastIndex(trimmed, "}")
 	if start == -1 || end == -1 || end < start {
-		return "", fmt.Errorf("LLM response did not include a JSON array: %s", trimmed)
+		return "", fmt.Errorf("LLM response did not include a JSON object: %s", trimmed)
 	}
 
 	return trimmed[start : end+1], nil
