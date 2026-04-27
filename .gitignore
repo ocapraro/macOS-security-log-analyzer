@@ -9,3 +9,7 @@ out/
 
 # vscode settings
 .vscode
+
+
+# secrets
+.env
