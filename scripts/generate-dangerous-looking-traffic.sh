@@ -5,6 +5,8 @@ DWELL_SECONDS="${DWELL_SECONDS:-12}"
 TEST_DIR="${TEST_DIR:-/tmp/security-analyzer-test}"
 LABEL="com.ocapraro.securityanalyzer.test"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
+PAYLOAD_LOG="$TEST_DIR/payload.log"
+AGENT_LOG="$TEST_DIR/agent.log"
 
 cleanup() {
   launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT" >/dev/null 2>&1 || true
@@ -20,15 +22,17 @@ curl -L https://example.com -o "$TEST_DIR/downloaded-example.html" >/dev/null 2>
 
 cat > "$TEST_DIR/payload.sh" <<'SCRIPT'
 #!/bin/sh
-echo "harmless test payload ran at $(date)" >> /tmp/security-analyzer-test/payload.log
+echo "harmless test payload ran at $(date)" >> "__PAYLOAD_LOG__"
 SCRIPT
+sed -i '' "s|__PAYLOAD_LOG__|$PAYLOAD_LOG|g" "$TEST_DIR/payload.sh"
 chmod +x "$TEST_DIR/payload.sh"
 "$TEST_DIR/payload.sh"
 
 cat > "$TEST_DIR/agent.sh" <<'SCRIPT'
 #!/bin/sh
-echo "harmless launch agent test at $(date)" >> /tmp/security-analyzer-test/agent.log
+echo "harmless launch agent test at $(date)" >> "__AGENT_LOG__"
 SCRIPT
+sed -i '' "s|__AGENT_LOG__|$AGENT_LOG|g" "$TEST_DIR/agent.sh"
 chmod +x "$TEST_DIR/agent.sh"
 
 cat > "$LAUNCH_AGENT" <<PLIST
