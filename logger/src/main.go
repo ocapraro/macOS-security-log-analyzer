@@ -20,18 +20,28 @@ import (
 )
 
 const (
-	llmBatchThreshold = 25
+	llmBatchThreshold = 3
+	llmMaxBatchAge    = 10 * time.Second
+	llmRequestTimeout = 35 * time.Second
 	llmRetryBackoff   = 15 * time.Second
+	maxLLMLogLineLen  = 1200
 )
 
 type event struct {
-	TS          int64  `json:"ts"`
-	Event       string `json:"event"`
-	PID         int    `json:"pid"`
-	PPID        int    `json:"ppid"`
-	ChildPID    int    `json:"child_pid"`
-	ProcessPath string `json:"process_path"`
-	TargetPath  string `json:"target_path"`
+	TS             int64  `json:"ts"`
+	FirstTS        int64  `json:"first_ts"`
+	Event          string `json:"event"`
+	PID            int    `json:"pid"`
+	PPID           int    `json:"ppid"`
+	ChildPID       int    `json:"child_pid"`
+	Count          int    `json:"count"`
+	SamplePID      int    `json:"sample_pid"`
+	LastPID        int    `json:"last_pid"`
+	PIDCount       int    `json:"pid_count"`
+	LastPPID       int    `json:"last_ppid"`
+	SampleChildPID int    `json:"sample_child_pid"`
+	ProcessPath    string `json:"process_path"`
+	TargetPath     string `json:"target_path"`
 }
 
 func main() {
@@ -91,7 +101,8 @@ func main() {
 
 	fmt.Printf("Starting monitor: %s\n", monitorPath)
 
-	cmd := exec.Command(monitorPath)
+	cmd := monitorCommand(monitorPath)
+	cmd.Stdin = os.Stdin
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to access monitor stdout: %v\n", err)
@@ -133,6 +144,7 @@ func main() {
 	go func() {
 		<-stop
 		fmt.Printf("\nShutdown signal received. Graceful shutdown...\n")
+		llmCancel()
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
@@ -155,10 +167,10 @@ func main() {
 
 	streamErrors := make(chan error, 2)
 	go func() {
-		streamErrors <- streamAndFormat(stdout, logFile, &logFileMu, logLines)
+		streamErrors <- streamAndFormat(stdout, logFile, &logFileMu, analysisFile, &analysisFileMu, logLines, true)
 	}()
 	go func() {
-		streamErrors <- streamAndFormat(stderr, logFile, &logFileMu, logLines)
+		streamErrors <- streamAndFormat(stderr, logFile, &logFileMu, analysisFile, &analysisFileMu, logLines, false)
 	}()
 
 	for i := 0; i < 2; i++ {
@@ -185,6 +197,14 @@ func main() {
 	}
 }
 
+func monitorCommand(monitorPath string) *exec.Cmd {
+	if os.Geteuid() == 0 {
+		return exec.Command(monitorPath)
+	}
+
+	return exec.Command("sudo", monitorPath)
+}
+
 func findRepoRoot() (string, error) {
 	current, err := os.Getwd()
 	if err != nil {
@@ -209,6 +229,7 @@ func findRepoRoot() (string, error) {
 
 func resolveOrBuildMonitor(repoRoot string) (string, error) {
 	candidates := []string{
+		filepath.Join(repoRoot, "monitor", "out", "SecurityAnalyzer.app", "Contents", "MacOS", "SecurityAnalyzer"),
 		filepath.Join(repoRoot, "es-test"),
 		filepath.Join(repoRoot, "out", "es-test"),
 		filepath.Join(repoRoot, "monitor", "out", "es-test"),
@@ -278,7 +299,15 @@ func isExecutable(path string) bool {
 	return info.Mode()&0o111 != 0
 }
 
-func streamAndFormat(reader io.Reader, logFile *os.File, logFileMu *sync.Mutex, logLines chan<- string) error {
+func streamAndFormat(
+	reader io.Reader,
+	logFile *os.File,
+	logFileMu *sync.Mutex,
+	analysisFile *os.File,
+	analysisFileMu *sync.Mutex,
+	logLines chan<- string,
+	forwardToLLM bool,
+) error {
 	scanner := bufio.NewScanner(reader)
 	buffer := make([]byte, 0, 64*1024)
 	scanner.Buffer(buffer, 1024*1024)
@@ -289,16 +318,131 @@ func streamAndFormat(reader io.Reader, logFile *os.File, logFileMu *sync.Mutex, 
 			continue
 		}
 
+		e, isEvent := parseEvent(line)
 		formatted := formatLine(line)
 		if err := appendLogLine(logFile, logFileMu, formatted); err != nil {
 			return err
 		}
-		if logLines != nil {
-			logLines <- formatted
+		if logLines != nil && forwardToLLM && isEvent {
+			severity := localSeverity(e)
+			if severity == "suspicious" || severity == "dangerous" {
+				if analysisFile != nil {
+					appendLocalAssessment(analysisFile, analysisFileMu, formatted, severity)
+				}
+				logLines <- truncateLogLine(formatted, maxLLMLogLineLen)
+			}
 		}
 	}
 
 	return scanner.Err()
+}
+
+func appendLocalAssessment(analysisFile *os.File, analysisFileMu *sync.Mutex, logLine string, severity string) {
+	assessment := llmBatchAssessment{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Reasoning: "Local rule matched before LLM analysis.",
+	}
+
+	if severity == "dangerous" {
+		assessment.DangerousLogs = []string{logLine}
+	} else {
+		assessment.SuspicousLogs = []string{logLine}
+	}
+
+	payload, err := json.MarshalIndent(assessment, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to serialize local assessment: %v\n", err)
+		return
+	}
+	if err := appendLogBlock(analysisFile, analysisFileMu, string(payload)); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing local assessment: %v\n", err)
+	}
+}
+
+func parseEvent(line string) (event, bool) {
+	var e event
+	if err := json.Unmarshal([]byte(line), &e); err != nil {
+		return event{}, false
+	}
+
+	switch e.Event {
+	case "exec", "fork", "write":
+		return e, true
+	default:
+		return event{}, false
+	}
+}
+
+func shouldAnalyzeEvent(e event) bool {
+	return localSeverity(e) != "normal"
+}
+
+func localSeverity(e event) string {
+	processPath := strings.ToLower(e.ProcessPath)
+	targetPath := strings.ToLower(e.TargetPath)
+
+	if strings.Contains(targetPath, "/macos-security-log-analyzer/logger/out/") {
+		return "normal"
+	}
+	if strings.Contains(processPath, "/library/caches/go-build/") || strings.Contains(processPath, "/go-build") {
+		return "normal"
+	}
+
+	switch e.Event {
+	case "exec":
+		if isUserTempPath(targetPath) || isUserTempPath(processPath) {
+			return "dangerous"
+		}
+		if hasAnySuffix(targetPath, "/curl", "/nscurl", "/wget", "/python", "/python3", "/perl", "/ruby", "/osascript", "/bash", "/zsh", "/sh", "/launchctl") {
+			return "suspicious"
+		}
+	case "write":
+		if strings.Contains(targetPath, "/library/launchagents/") ||
+			strings.Contains(targetPath, "/library/launchdaemons/") ||
+			strings.Contains(targetPath, "/system/library/launchagents/") ||
+			strings.Contains(targetPath, "/system/library/launchdaemons/") {
+			return "dangerous"
+		}
+		if isUserTempPath(targetPath) && hasAnySuffix(targetPath, ".sh", ".command", ".py", ".pl", ".rb", ".dylib", ".so", ".plist") {
+			return "suspicious"
+		}
+		if strings.Contains(targetPath, "/.ssh/authorized_keys") ||
+			hasAnySuffix(targetPath, "/.zshrc", "/.zprofile", "/.bashrc", "/.bash_profile", "/.profile", "/crontab") ||
+			strings.Contains(targetPath, "/etc/cron") ||
+			strings.Contains(targetPath, "/usr/local/bin/") ||
+			strings.Contains(targetPath, "/opt/homebrew/bin/") {
+			return "suspicious"
+		}
+	case "fork":
+		if isUserTempPath(processPath) {
+			return "suspicious"
+		}
+	}
+
+	return "normal"
+}
+
+func isUserTempPath(path string) bool {
+	return strings.HasPrefix(path, "/tmp/") ||
+		strings.HasPrefix(path, "/private/tmp/") ||
+		strings.HasPrefix(path, "/var/tmp/")
+}
+
+func hasAnySuffix(value string, suffixes ...string) bool {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(value, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateLogLine(line string, maxLen int) string {
+	if maxLen <= 0 || len(line) <= maxLen {
+		return line
+	}
+
+	return line[:maxLen] + "... [truncated]"
 }
 
 func formatLine(line string) string {
@@ -308,29 +452,59 @@ func formatLine(line string) string {
 	}
 
 	timeStamp := time.Unix(e.TS, 0).Format(time.RFC3339)
+	if e.TS == 0 {
+		timeStamp = time.Now().Format(time.RFC3339)
+	}
+	count := e.Count
+	if count == 0 {
+		count = 1
+	}
+	pid := e.PID
+	if pid == 0 {
+		pid = e.SamplePID
+	}
+	ppid := e.PPID
+	if ppid == 0 {
+		ppid = e.LastPPID
+	}
 
 	switch e.Event {
 	case "exec":
 		return fmt.Sprintf(
-			"[%s] EXEC: process pid=%d ppid=%d launched %s and targeted %s",
+			"[%s] EXEC: count=%d sample_pid=%d last_pid=%d pid_count=%d last_ppid=%d launched %s and targeted %s",
 			timeStamp,
-			e.PID,
-			e.PPID,
+			count,
+			pid,
+			e.LastPID,
+			e.PIDCount,
+			ppid,
 			emptyFallback(e.ProcessPath, "unknown process"),
 			emptyFallback(e.TargetPath, "unknown target"),
 		)
 	case "fork":
+		childPID := e.ChildPID
+		if childPID == 0 {
+			childPID = e.SampleChildPID
+		}
 		return fmt.Sprintf(
-			"[%s] FORK: parent pid=%d created child pid=%d",
+			"[%s] FORK: count=%d sample_pid=%d last_pid=%d pid_count=%d process=%s sample_child_pid=%d",
 			timeStamp,
-			e.PID,
-			e.ChildPID,
+			count,
+			pid,
+			e.LastPID,
+			e.PIDCount,
+			emptyFallback(e.ProcessPath, "unknown process"),
+			childPID,
 		)
 	case "write":
 		return fmt.Sprintf(
-			"[%s] WRITE: process pid=%d wrote to %s",
+			"[%s] WRITE: count=%d sample_pid=%d last_pid=%d pid_count=%d process=%s wrote to %s",
 			timeStamp,
-			e.PID,
+			count,
+			pid,
+			e.LastPID,
+			e.PIDCount,
+			emptyFallback(e.ProcessPath, "unknown process"),
 			emptyFallback(e.TargetPath, "unknown path"),
 		)
 	default:
@@ -421,6 +595,9 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 		if len(pending) == 0 {
 			return
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		if !force && !retryAfter.IsZero() && time.Now().Before(retryAfter) {
 			return
 		}
@@ -477,7 +654,7 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 
 		if len(combined.NormalLogs)+len(combined.SuspicousLogs)+len(combined.DangerousLogs) == 0 {
 			fmt.Println("No valid assessments from batch.")
-			if len(failedLogs) > 0 {
+			if len(failedLogs) > 0 && ctx.Err() == nil {
 				pending = append(failedLogs, pending...)
 				if oldest.IsZero() {
 					oldest = time.Now()
@@ -488,7 +665,7 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 			return
 		}
 
-		if len(failedLogs) > 0 {
+		if len(failedLogs) > 0 && ctx.Err() == nil {
 			pending = append(failedLogs, pending...)
 			if oldest.IsZero() {
 				oldest = time.Now()
@@ -546,28 +723,35 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 				flush("count>=25", false)
 			}
 		case <-ticker.C:
-			if len(pending) > 0 && !oldest.IsZero() && time.Since(oldest) >= 1*time.Minute {
-				flush("age>=1m", false)
+			if len(pending) > 0 && !oldest.IsZero() && time.Since(oldest) >= llmMaxBatchAge {
+				flush("age>=10s", false)
 			}
 		}
 	}
 }
 
 func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llmInstance string) (llmBatchAssessment, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, llmRequestTimeout)
+	defer cancel()
+
 	logsJSON, err := json.Marshal(logLines)
 	if err != nil {
 		return llmBatchAssessment{}, fmt.Errorf("unable to prepare log batch: %w", err)
 	}
 
 	prompt := fmt.Sprintf(
-		"You are a security log analyst. Review the JSON array of logs below and return ONE JSON object only with this exact shape: {\"timestamp\":\"RFC3339\",\"reasoning\":\"...\",\"normalLogs\":[],\"suspicousLogs\":[],\"dangerousLogs\":[]}. Use only exact log lines from input arrays. Do not use markdown, code fences, or extra text. Return ONLY raw JSON.\\n\\nExample transaction:\\nInput logs: [\"[2026-04-26T20:00:00Z] EXEC: process pid=120 ppid=1 launched /usr/bin/vim and targeted /tmp/note.txt\",\"[2026-04-26T20:00:01Z] EXEC: process pid=121 ppid=1 launched /usr/bin/curl and targeted http://bad.test/payload\",\"[2026-04-26T20:00:02Z] EXEC: process pid=122 ppid=121 launched /tmp/payload and targeted /tmp/payload\"]\\nOutput JSON: {\"timestamp\":\"2026-04-26T20:00:03Z\",\"reasoning\":\"curl to external payload URL followed by execution from /tmp indicates likely malware staging.\",\"normalLogs\":[\"[2026-04-26T20:00:00Z] EXEC: process pid=120 ppid=1 launched /usr/bin/vim and targeted /tmp/note.txt\"],\"suspicousLogs\":[\"[2026-04-26T20:00:01Z] EXEC: process pid=121 ppid=1 launched /usr/bin/curl and targeted http://bad.test/payload\"],\"dangerousLogs\":[\"[2026-04-26T20:00:02Z] EXEC: process pid=122 ppid=121 launched /tmp/payload and targeted /tmp/payload\"]}\\n\\nNow analyze this input and return ONLY raw JSON.\\n\\nLogs: %s",
+		"You are a security log analyst. Review the JSON array of logs below and return one JSON object with this exact shape: {\"timestamp\":\"RFC3339\",\"reasoning\":\"...\",\"normalLogs\":[],\"suspicousLogs\":[],\"dangerousLogs\":[]}. Put each input log in exactly one array. Use only exact strings from the input array; never invent placeholders like N/A and never rewrite log lines. Treat routine Apple system writes as normal unless they show clear persistence, external download, privilege escalation, shell execution, or writes into unusual executable locations. Return JSON only.\\n\\nLogs: %s",
 		string(logsJSON),
 	)
 
 	payload := map[string]any{
 		"model":  llmInstance,
 		"prompt": prompt,
+		"format": "json",
 		"stream": false,
+		"options": map[string]any{
+			"temperature": 0,
+		},
 	}
 
 	requestBody, err := json.Marshal(payload)
@@ -576,13 +760,13 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 	}
 
 	requestURL := ollamaGenerateURL(ollamaEndpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
 	if err != nil {
 		return llmBatchAssessment{}, fmt.Errorf("unable to create Ollama request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := (&http.Client{}).Do(req)
+	resp, err := (&http.Client{Timeout: llmRequestTimeout + 5*time.Second}).Do(req)
 	if err != nil {
 		return llmBatchAssessment{}, fmt.Errorf("unable to call Ollama endpoint %s: %w", requestURL, err)
 	}
@@ -619,6 +803,8 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 		return fallbackBatchAssessment(logLines, parsed.Response), nil
 	}
 
+	assessment = sanitizeAssessment(assessment, logLines)
+
 	if strings.TrimSpace(assessment.Timestamp) == "" {
 		assessment.Timestamp = time.Now().Format(time.RFC3339)
 	}
@@ -630,21 +816,105 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 	return assessment, nil
 }
 
+func sanitizeAssessment(assessment llmBatchAssessment, inputLogs []string) llmBatchAssessment {
+	allowed := make(map[string]bool, len(inputLogs))
+	for _, log := range inputLogs {
+		allowed[log] = true
+	}
+
+	used := make(map[string]bool, len(inputLogs))
+	normalLogs := filterAssessmentLogs(assessment.NormalLogs, allowed, used)
+	suspiciousLogs := filterAssessmentLogs(assessment.SuspicousLogs, allowed, used)
+	dangerousLogs := filterAssessmentLogs(assessment.DangerousLogs, allowed, used)
+
+	for _, log := range inputLogs {
+		if !used[log] {
+			suspiciousLogs = append(suspiciousLogs, log)
+		}
+	}
+
+	assessment.NormalLogs = []string{}
+	assessment.SuspicousLogs = []string{}
+	assessment.DangerousLogs = []string{}
+
+	for _, log := range append(append(normalLogs, suspiciousLogs...), dangerousLogs...) {
+		switch localSeverityFromFormattedLine(log) {
+		case "dangerous":
+			assessment.DangerousLogs = append(assessment.DangerousLogs, log)
+		case "suspicious":
+			assessment.SuspicousLogs = append(assessment.SuspicousLogs, log)
+		default:
+			assessment.NormalLogs = append(assessment.NormalLogs, log)
+		}
+	}
+
+	return assessment
+}
+
+func filterAssessmentLogs(logs []string, allowed map[string]bool, used map[string]bool) []string {
+	filtered := make([]string, 0, len(logs))
+	for _, log := range logs {
+		if allowed[log] && !used[log] {
+			filtered = append(filtered, log)
+			used[log] = true
+		}
+	}
+	return filtered
+}
+
 func fallbackBatchAssessment(logLines []string, rawResponse string) llmBatchAssessment {
 	reason := strings.TrimSpace(rawResponse)
 	if reason == "" {
-		reason = "LLM returned no structured JSON response; defaulted all logs to suspicious."
+		reason = "LLM returned no structured JSON response; used local rule-based classification."
 	} else {
-		reason = "LLM returned non-JSON response; defaulted all logs to suspicious. Raw response: " + reason
+		reason = "LLM returned non-JSON response; used local rule-based classification. Raw response: " + truncateLogLine(reason, 2000)
 	}
 
-	return llmBatchAssessment{
+	assessment := llmBatchAssessment{
 		Timestamp:     time.Now().Format(time.RFC3339),
 		Reasoning:     reason,
 		NormalLogs:    []string{},
-		SuspicousLogs: append([]string(nil), logLines...),
+		SuspicousLogs: []string{},
 		DangerousLogs: []string{},
 	}
+
+	for _, line := range logLines {
+		switch localSeverityFromFormattedLine(line) {
+		case "dangerous":
+			assessment.DangerousLogs = append(assessment.DangerousLogs, line)
+		case "suspicious":
+			assessment.SuspicousLogs = append(assessment.SuspicousLogs, line)
+		default:
+			assessment.NormalLogs = append(assessment.NormalLogs, line)
+		}
+	}
+
+	return assessment
+}
+
+func localSeverityFromFormattedLine(line string) string {
+	lower := strings.ToLower(line)
+	if strings.Contains(lower, "/library/launchagents/") ||
+		strings.Contains(lower, "/library/launchdaemons/") ||
+		(strings.Contains(lower, " exec: ") && (strings.Contains(lower, " targeted /tmp/") || strings.Contains(lower, " targeted /private/tmp/") || strings.Contains(lower, " targeted /var/tmp/"))) {
+		return "dangerous"
+	}
+	if strings.Contains(lower, "/tmp/") ||
+		strings.Contains(lower, "/private/tmp/") ||
+		strings.Contains(lower, "/var/tmp/") ||
+		strings.Contains(lower, "/.ssh/authorized_keys") ||
+		strings.Contains(lower, "/.zshrc") ||
+		strings.Contains(lower, "/.bashrc") ||
+		strings.Contains(lower, "/usr/local/bin/") ||
+		strings.Contains(lower, "/opt/homebrew/bin/") ||
+		strings.Contains(lower, " targeted /usr/bin/curl") ||
+		strings.Contains(lower, " targeted /usr/bin/python") ||
+		strings.Contains(lower, " targeted /bin/sh") ||
+		strings.Contains(lower, " targeted /bin/bash") ||
+		strings.Contains(lower, " targeted /bin/zsh") {
+		return "suspicious"
+	}
+	return "normal"
 }
 
 func extractJSONObjectPayload(response string) (string, error) {
