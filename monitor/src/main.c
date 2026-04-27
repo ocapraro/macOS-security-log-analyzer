@@ -70,7 +70,7 @@ int main(void) {
         return 1;
     }
 
-    fprintf(stderr, "{\"status\":\"ES client subscribed, monitoring events...\"}\n");
+    fprintf(stderr, "{\"status\":\"ok\"}\n");
 
     dispatch_main();
     return 0;

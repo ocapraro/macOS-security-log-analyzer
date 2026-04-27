@@ -50,9 +50,7 @@ func main() {
 	if err == nil {
 		version := strings.TrimSpace(string(versionOutput))
 		if strings.HasPrefix(version, "26.") {
-			fmt.Printf("WARNING: macOS 26 beta detected -- Endpoint Security is not yet functional in this beta.\n")
-			fmt.Printf("    The monitor will emit synthetic events instead.\n")
-			fmt.Printf("    ES is fully functional on macOS 15.x and later stable releases.\n\n")
+			fmt.Printf("WARNING: macOS 26 beta; Endpoint Security not available.\\n\\n")
 		}
 	}
 
@@ -91,11 +89,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Logger started. Running monitor: %s\n", monitorPath)
-	fmt.Printf("Verbose logs will be written to: %s\n", logFilePath)
-	if llmConfigErr == nil {
-		fmt.Printf("LLM analysis will be written to: %s\n", analysisFilePath)
-	}
+	fmt.Printf("Starting monitor: %s\n", monitorPath)
 
 	cmd := exec.Command(monitorPath)
 	stdout, err := cmd.StdoutPipe()
@@ -138,22 +132,20 @@ func main() {
 
 	go func() {
 		sig := <-stop
-		fmt.Printf("\nReceived stop signal (%s). Attempting graceful shutdown...\n", sig.String())
+		fmt.Printf("\nShutdown signal received. Graceful shutdown...\n")
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
 
 		select {
 		case second := <-stop:
-			fmt.Printf("Received second stop signal (%s). Forcing monitor shutdown now...\n", second.String())
-			fmt.Println("Cancelling in-flight LLM requests...")
+			fmt.Printf("Force kill...\n")
 			llmCancel()
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
 		case <-time.After(5 * time.Second):
-			fmt.Println("Graceful shutdown timed out. Forcing monitor shutdown...")
-			fmt.Println("Cancelling in-flight LLM requests...")
+			fmt.Println("Timeout. Forcing shutdown...")
 			llmCancel()
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
@@ -181,7 +173,7 @@ func main() {
 		select {
 		case <-llmDone:
 		case <-time.After(2 * time.Second):
-			fmt.Println("LLM worker is still shutting down; exiting without waiting further.")
+			fmt.Println("LLM timeout; exiting without wait.")
 		}
 	}
 
@@ -431,13 +423,13 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 		pending = pending[:0]
 		oldest = time.Time{}
 
-		fmt.Printf("LLM dispatch (%s): sending %d new logs\n", trigger, len(batch))
+		fmt.Printf("Batch (%s): %d logs\n", trigger, len(batch))
 
 		batches := [][]string{batch}
 		if len(batch) > 25 {
 			mid := (len(batch) + 1) / 2
 			batches = [][]string{batch[:mid], batch[mid:]}
-			fmt.Printf("LLM dispatch: splitting into %d concurrent requests (%d + %d logs)\n", len(batches), len(batches[0]), len(batches[1]))
+			fmt.Printf("Split: 2 requests (%d + %d)\n", len(batches[0]), len(batches[1]))
 		}
 
 		type result struct {
@@ -465,7 +457,7 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 		for i := 0; i < len(batches); i++ {
 			result := <-results
 			if result.err != nil {
-				fmt.Fprintf(os.Stderr, "LLM dispatch failed for %d logs: %v\n", len(result.logs), result.err)
+				fmt.Fprintf(os.Stderr, "Batch failed: %d logs: %v\n", len(result.logs), result.err)
 				failedLogs = append(failedLogs, result.logs...)
 				continue
 			}
@@ -478,14 +470,14 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 		}
 
 		if len(combined.NormalLogs)+len(combined.SuspicousLogs)+len(combined.DangerousLogs) == 0 {
-			fmt.Println("LLM dispatch returned no parsed assessments.")
+			fmt.Println("No valid assessments from batch.")
 			if len(failedLogs) > 0 {
 				pending = append(failedLogs, pending...)
 				if oldest.IsZero() {
 					oldest = time.Now()
 				}
 				retryAfter = time.Now().Add(llmRetryBackoff)
-				fmt.Printf("LLM retry scheduled in %s for %d logs\n", llmRetryBackoff, len(failedLogs))
+				fmt.Printf("Retry in %s for %d logs\n", llmRetryBackoff, len(failedLogs))
 			}
 			return
 		}
@@ -496,7 +488,7 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 				oldest = time.Now()
 			}
 			retryAfter = time.Now().Add(llmRetryBackoff)
-			fmt.Printf("LLM partial success; retrying %d failed logs in %s\n", len(failedLogs), llmRetryBackoff)
+			fmt.Printf("Partial success; retrying %d logs in %s\n", len(failedLogs), llmRetryBackoff)
 		} else {
 			retryAfter = time.Time{}
 		}
@@ -509,23 +501,23 @@ func runLLMAnalysisLoop(ctx context.Context, logLines <-chan string, analysisFil
 		}
 
 		total := len(combined.NormalLogs) + len(combined.SuspicousLogs) + len(combined.DangerousLogs)
-		fmt.Printf("LLM response received for %d logs (normal=%d suspicious=%d dangerous=%d)\n",
+		fmt.Printf("Assessment: %d logs (normal=%d suspicious=%d dangerous=%d)\n",
 			total, len(combined.NormalLogs), len(combined.SuspicousLogs), len(combined.DangerousLogs))
 		for _, log := range combined.NormalLogs {
-			fmt.Printf("  [NORMAL]    %s\n", log)
+			fmt.Printf("  [OK] %s\n", log)
 		}
 		for _, log := range combined.SuspicousLogs {
-			fmt.Printf("  [SUSPICIOUS] %s\n", log)
+			fmt.Printf("  [WARN] %s\n", log)
 		}
 		for _, log := range combined.DangerousLogs {
-			fmt.Printf("  [DANGEROUS]  %s\n", log)
+			fmt.Printf("  [ALERT] %s\n", log)
 		}
 		if strings.TrimSpace(combined.Reasoning) != "" {
-			fmt.Printf("  Reasoning: %s\n", combined.Reasoning)
+			fmt.Printf("  %s\n", combined.Reasoning)
 		}
 
 		if err := appendLogBlock(analysisFile, analysisFileMu, string(payload)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to append LLM analysis to log: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error writing analysis: %v\n", err)
 		}
 	}
 
@@ -578,7 +570,6 @@ func analyzeLogBatch(ctx context.Context, logLines []string, ollamaEndpoint, llm
 	}
 
 	requestURL := ollamaGenerateURL(ollamaEndpoint)
-	fmt.Printf("LLM request start: endpoint=%s model=%s logs=%d timeout=none\n", requestURL, llmInstance, len(logLines))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
 	if err != nil {
 		return llmBatchAssessment{}, fmt.Errorf("unable to create Ollama request: %w", err)
